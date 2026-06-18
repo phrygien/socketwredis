@@ -1,6 +1,6 @@
 /**
  * Serveur Socket.IO — Auctav Live Sales
- * Version adaptée pour le client existant
+ * Version compatible avec Socket.IO v2.3.0 (client existant)
  * MODE CLUSTER AVEC REDIS ADAPTER
  */
 
@@ -40,7 +40,7 @@ const server = http.createServer(app);
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
-// CORS POUR EXPRESS - Support credentials
+// CORS POUR EXPRESS
 // -----------------------------------------------------------------------------
 
 const ALLOWED_ORIGINS = [
@@ -97,7 +97,6 @@ app.get("/test", (_req, res) => {
   });
 });
 
-// Followers debug
 app.get("/follow/:room", (req, res) => {
   res.json({
     room: req.params.room,
@@ -105,7 +104,6 @@ app.get("/follow/:room", (req, res) => {
   });
 });
 
-// Screens debug
 app.get("/screen/:room", (req, res) => {
   res.json({
     room: req.params.room,
@@ -114,24 +112,20 @@ app.get("/screen/:room", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// SOCKET.IO - Configuration pour client existant
+// SOCKET.IO - Configuration spécifique pour v2
 // -----------------------------------------------------------------------------
 
 const io = new Server(server, {
-  // Configuration pour Socket.IO v2/v3 (compatible avec votre client)
+  // Configuration pour Socket.IO v2
   pingInterval: 25000,
   pingTimeout: 60000,
   maxHttpBufferSize: 1e7,
-  perMessageDeflate: {
-    threshold: 8192,
-  },
 
-  // Transports - matching client
+  // Transports - matching client v2
   transports: ["polling", "websocket"],
   allowUpgrades: true,
-  allowEIO3: true,
 
-  // CORS - Support credentials comme le client l'utilise
+  // CORS - Support credentials
   cors: {
     origin: function (origin, callback) {
       if (!origin) {
@@ -150,21 +144,31 @@ const io = new Server(server, {
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   },
 
-  // Désactiver le cookie pour éviter les problèmes
+  // Désactiver le cookie
   cookie: false,
 
   // Path par défaut
   path: "/socket.io/",
+
+  // Permettre les anciennes versions
+  allowEIO3: false,
 });
 
 // -----------------------------------------------------------------------------
-// LOGGING DES REQUETES (pour debug)
+// ENGINE.IO CONFIGURATION - Important pour v2
 // -----------------------------------------------------------------------------
 
-io.use((socket, next) => {
-  const req = socket.request;
-  log(`[SOCKET REQUEST] URL: ${req.url}`);
-  next();
+io.engine.on("connection_error", (err) => {
+  log(`[ENGINE ERROR] ${err.code} - ${err.message}`);
+});
+
+io.engine.on("connection", (socket) => {
+  log(`[ENGINE] Connection from: ${socket.id}`);
+  log(`[ENGINE] Transport: ${socket.transport.name}`);
+
+  socket.on("upgrade", () => {
+    log(`[ENGINE] Upgrade to: ${socket.transport.name}`);
+  });
 });
 
 // -----------------------------------------------------------------------------
@@ -253,7 +257,6 @@ io.on("connection", (socket) => {
     log(`[ERROR] ${socket.id}: ${err.message}`);
   });
 
-  // Enregistrer les handlers
   registerAdminHandler(io, socket);
   registerBidderHandler(io, socket);
   registerRoomHandler(io, socket);
