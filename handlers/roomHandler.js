@@ -6,8 +6,8 @@
 //  3. Liste blanche des types autorisés (ALLOWED_TYPES)
 //  4. Types sensibles réservés à l'admin (ADMIN_ONLY_TYPES)
 //  5. listLot inclus dans ADMIN_ONLY_TYPES
-//  6. Anti-flood joinroom (throttle 2 s par socket)
-//  7. Max 1 salle active par socket (pas de multi-room)
+//  6. Anti-flood joinroom via Redis (TTL auto-expirant)
+//  7. Max 1 salle active par socket
 //  8. Cap taille payload getMsgRoom (50 Ko)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -17,41 +17,40 @@ const {
   getAdminOfRoom,
   broadcastUserList,
 } = require("../services/roomService");
+const redis = require("../redis");
 const fs = require("fs");
 const path = require("path");
 
 // ── Chemin vers l'historique ──────────────────────────────────────────────────
 const HISTORIQUE_PATH = path.resolve(__dirname, "../historique.json");
 
-// ── Throttle joinroom (partagé avec server.js pour le nettoyage disconnect) ───
-// Map socketId → timestamp de la dernière tentative joinroom
-const joinroomThrottle = new Map();
-const JOINROOM_THROTTLE_MS = 2000; // 1 joinroom max toutes les 2 secondes
+// ── Throttle joinroom ─────────────────────────────────────────────────────────
+//
+//  Stratégie Redis : clé "throttle:joinroom:<socketId>" avec TTL 2s.
+//  Si la clé existe → throttle actif → on refuse.
+//  Fallback Map mémoire si Redis indisponible.
+//
+//  La Map est exportée pour que server.js la nettoie au disconnect
+//  (cas fallback uniquement — Redis gère son propre TTL).
+
+const joinroomThrottle = new Map(); // fallback mémoire
+const JOINROOM_THROTTLE_S = 2; // secondes entre deux joinroom
 
 // ── Cap taille payload ────────────────────────────────────────────────────────
 const MAX_PAYLOAD_BYTES = 50_000; // 50 Ko max par événement getMsgRoom
 
 // ── Listes de contrôle ────────────────────────────────────────────────────────
 
-/**
- * Tous les types qu'un socket peut diffuser via getMsgRoom.
- * Tout type absent est bloqué, même s'il existe côté client.
- */
 const ALLOWED_TYPES = new Set([
-  "listLot", // liste complète des lots (admin → salle)
-  "numLot", // changement de lot en cours (admin → screen.php)
-  "previousLot", // lot précédent avec prix adjugé (admin → screen.php)
-  "message", // message texte libre (admin → follow.php)
-  "users", // liste HTML des bidders connectés (admin → follow.php)
-  "closeEnchere", // clôture d'une enchère (admin → results.php)
-  "updateLot", // mise à jour d'un lot (admin → results.php)
+  "listLot",
+  "numLot",
+  "previousLot",
+  "message",
+  "users",
+  "closeEnchere",
+  "updateLot",
 ]);
 
-/**
- * Types réservés à l'admin.
- * Un bidder ou un visiteur qui émet l'un de ces types est bloqué,
- * même s'il a rejoint la salle correctement.
- */
 const ADMIN_ONLY_TYPES = new Set([
   "listLot",
   "numLot",
@@ -100,13 +99,35 @@ function updateHistoriquePseudo(socketId, pseudo) {
   }
 }
 
-/**
- * Récupère l'IP réelle du socket (prend en compte les proxies).
- */
 function getClientIp(socket) {
   const forwarded = socket.handshake.headers["x-forwarded-for"];
   if (forwarded) return forwarded.split(",")[0].trim();
   return socket.handshake.address || "inconnue";
+}
+
+// ── Throttle joinroom — Redis avec fallback mémoire ───────────────────────────
+
+/**
+ * Vérifie si le socket peut faire un joinroom.
+ * Retourne true si autorisé, false si throttlé.
+ */
+async function checkJoinroomThrottle(socketId) {
+  const key = `throttle:joinroom:${socketId}`;
+
+  try {
+    // SET NX EX : pose la clé seulement si elle n'existe pas, TTL 2s
+    const result = await redis.set(key, "1", "EX", JOINROOM_THROTTLE_S, "NX");
+    // result = "OK" si la clé a été posée (premier appel dans la fenêtre)
+    // result = null si la clé existait déjà (throttle actif)
+    return result === "OK";
+  } catch {
+    // Fallback mémoire si Redis indisponible
+    const now = Date.now();
+    const last = joinroomThrottle.get(socketId) || 0;
+    if (now - last < JOINROOM_THROTTLE_S * 1000) return false;
+    joinroomThrottle.set(socketId, now);
+    return true;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,26 +137,16 @@ function registerRoomHandler(io, socket) {
   /**
    * Rejoindre une salle.
    * room = "auctav<saleId>"  ex: "auctav42"
-   *
-   * Protections :
-   *   - throttle : 1 joinroom max toutes les 2 secondes
-   *   - format   : string non vide, pattern auctav + chiffres
-   *   - max      : 1 seule salle active par socket
    */
-  socket.on("joinroom", (room) => {
-    // ── Contrôle 1 : throttle joinroom ───────────────────────────────────────
-    const now = Date.now();
-    const last = joinroomThrottle.get(socket.id) || 0;
-
-    if (now - last < JOINROOM_THROTTLE_MS) {
-      log(
-        `  [joinroom] THROTTLE – socket=${socket.id} (${now - last}ms depuis dernier joinroom)`,
-      );
+  socket.on("joinroom", async (room) => {
+    // ── Contrôle 1 : throttle joinroom (Redis) ────────────────────────────
+    const allowed = await checkJoinroomThrottle(socket.id);
+    if (!allowed) {
+      log(`  [joinroom] THROTTLE – socket=${socket.id}`);
       return;
     }
-    joinroomThrottle.set(socket.id, now);
 
-    // ── Contrôle 2 : format room ──────────────────────────────────────────────
+    // ── Contrôle 2 : format room ──────────────────────────────────────────
     if (typeof room !== "string" || !room.trim()) {
       log(`  [joinroom] REFUSÉ room invalide (type) – socket=${socket.id}`);
       return;
@@ -143,7 +154,6 @@ function registerRoomHandler(io, socket) {
 
     const roomTrimmed = room.trim();
 
-    // Pattern attendu : "auctav" suivi d'un ou plusieurs chiffres
     if (!/^auctav\d+$/.test(roomTrimmed)) {
       log(
         `  [joinroom] REFUSÉ room invalide (pattern) "${roomTrimmed}" – socket=${socket.id}`,
@@ -151,19 +161,17 @@ function registerRoomHandler(io, socket) {
       return;
     }
 
-    // ── Contrôle 3 : max 1 salle active par socket ───────────────────────────
+    // ── Contrôle 3 : max 1 salle active par socket ────────────────────────
     const meta = socketMeta.get(socket.id);
     const clientIp = getClientIp(socket);
 
     if (meta?.room && meta.room === roomTrimmed) {
-      // Déjà dans cette salle → silencieux, pas de double jointure
       log(
         `  [joinroom] IGNORÉ – socket=${socket.id} déjà dans "${roomTrimmed}"`,
       );
       return;
     }
 
-    // Quitter l'ancienne salle si nécessaire
     if (meta?.room) {
       const oldRoom = meta.room;
       socket.leave(oldRoom);
@@ -178,7 +186,6 @@ function registerRoomHandler(io, socket) {
       `  [joinroom] socket=${socket.id} → room="${roomTrimmed}" ip=${clientIp} admin=${meta?.isAdmin}`,
     );
 
-    // ── Sauvegarde historique ─────────────────────────────────────────────────
     appendHistorique({
       event: "joinroom",
       socketId: socket.id,
@@ -205,9 +212,7 @@ function registerRoomHandler(io, socket) {
   socket.on("username", (pseudo) => {
     if (typeof pseudo !== "string" || !pseudo.trim()) return;
 
-    // Limite la longueur du pseudo (anti-abus)
     const safePseudo = pseudo.trim().slice(0, 64);
-
     const meta = socketMeta.get(socket.id);
     if (meta) meta.pseudo = safePseudo;
 
@@ -218,18 +223,10 @@ function registerRoomHandler(io, socket) {
   // ───────────────────────────────────────────────────────────────────────────
   /**
    * Diffusion d'un message vers toute la salle.
-   *
    * data = { room, type, msg, name }
-   *
-   * Protections :
-   *   - champs obligatoires présents et valides
-   *   - le socket appartient bien à la salle déclarée
-   *   - type dans liste blanche
-   *   - types sensibles réservés admin
-   *   - taille du payload plafonnée à 50 Ko
    */
   socket.on("getMsgRoom", (data) => {
-    // ── Contrôle 1 : présence et format des champs obligatoires ──────────────
+    // ── Contrôle 1 : champs obligatoires ─────────────────────────────────
     if (!data || typeof data.room !== "string" || !data.room.trim()) {
       log(
         `  [getMsgRoom] REFUSÉ champ room absent/invalide – socket=${socket.id}`,
@@ -243,7 +240,7 @@ function registerRoomHandler(io, socket) {
       return;
     }
 
-    // ── Contrôle 2 : taille du payload ───────────────────────────────────────
+    // ── Contrôle 2 : taille du payload ───────────────────────────────────
     try {
       const payloadSize = JSON.stringify(data).length;
       if (payloadSize > MAX_PAYLOAD_BYTES) {
@@ -259,7 +256,7 @@ function registerRoomHandler(io, socket) {
       return;
     }
 
-    // ── Contrôle 3 : le socket doit appartenir à la salle déclarée ───────────
+    // ── Contrôle 3 : le socket appartient à la salle déclarée ────────────
     if (!socket.rooms.has(data.room)) {
       log(
         `  [getMsgRoom] REFUSÉ – ${socket.id} n'appartient pas à la salle "${data.room}"`,
@@ -267,7 +264,7 @@ function registerRoomHandler(io, socket) {
       return;
     }
 
-    // ── Contrôle 4 : type dans liste blanche ──────────────────────────────────
+    // ── Contrôle 4 : type dans liste blanche ──────────────────────────────
     if (!ALLOWED_TYPES.has(data.type)) {
       log(
         `  [getMsgRoom] REFUSÉ – type non autorisé "${data.type}" depuis ${socket.id}`,
@@ -275,7 +272,7 @@ function registerRoomHandler(io, socket) {
       return;
     }
 
-    // ── Contrôle 5 : types sensibles réservés à l'admin ──────────────────────
+    // ── Contrôle 5 : types sensibles réservés à l'admin ──────────────────
     const meta = socketMeta.get(socket.id);
     if (ADMIN_ONLY_TYPES.has(data.type) && !meta?.isAdmin) {
       log(
@@ -284,7 +281,7 @@ function registerRoomHandler(io, socket) {
       return;
     }
 
-    // ── Payload nettoyé ───────────────────────────────────────────────────────
+    // ── Payload nettoyé ───────────────────────────────────────────────────
     const payload = {
       type: data.type,
       msg: data.msg || {},

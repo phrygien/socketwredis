@@ -1,17 +1,18 @@
 /**
  * Serveur Socket.IO — Auctav Live Sales
- * VERSION STABLE MOBILE + APACHE + SOCKET.IO v2/v3/v4
+ * VERSION CLUSTER PM2 (-i max) + Redis adapter + Redis rate-limit
  */
 
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const { createAdapter } = require("@socket.io/redis-adapter");
 
 const { PORT } = require("./config");
 const socketMeta = require("./store");
 const { log } = require("./utils/logger");
+const redis = require("./redis");
 
-const { getRoomStats } = require("./services/roomService");
 const { registerAdminHandler } = require("./handlers/adminHandler");
 const { registerBidderHandler } = require("./handlers/bidderHandler");
 const {
@@ -56,12 +57,21 @@ const ALLOWED_ORIGINS = [
 // HEALTH CHECK
 // ─────────────────────────────────────────────────────────────
 
-app.get("/", (_req, res) => {
+app.get("/", async (_req, res) => {
+  let redisStatus = "ok";
+  try {
+    await redis.ping();
+  } catch {
+    redisStatus = "unavailable";
+  }
+
   res.json({
     status: "ok",
     uptime: process.uptime(),
     memory: process.memoryUsage(),
     sockets: socketMeta.size,
+    worker: process.pid,
+    redis: redisStatus,
   });
 });
 
@@ -84,20 +94,17 @@ app.get("/screen/:room", (req, res) => {
 // ─────────────────────────────────────────────────────────────
 
 const io = new Server(server, {
-  // MOBILE / RÉSEAUX LENTS
   pingInterval: 10000,
   pingTimeout: 20000,
-
-  // GROS PAYLOADS — plafond global côté transport (avant parsing applicatif)
-  maxHttpBufferSize: 1e7, // 10 Mo
-
-  // Compression — seuil relevé pour éviter de compresser les petits messages
+  maxHttpBufferSize: 1e7,
   perMessageDeflate: { threshold: 8192 },
-
-  // Compatibilité anciens clients
   allowEIO3: true,
 
-  // polling + websocket — polling aide sur réseaux mobiles lents
+  // En cluster, websocket seul évite les problèmes de sticky session
+  // si jamais un client ne supporte pas le upgrade.
+  // On garde polling EN PREMIER pour la compatibilité mobile,
+  // mais le sticky session Apache garantit que polling tombe
+  // toujours sur le même worker.
   transports: ["polling", "websocket"],
 
   cors: {
@@ -113,55 +120,118 @@ const io = new Server(server, {
 });
 
 // ─────────────────────────────────────────────────────────────
-// MIDDLEWARE 1 — RATE-LIMIT PAR IP
+// REDIS ADAPTER
+//
+//  Permet à io.to(room).emit() de traverser tous les workers.
+//  pubClient  → publie les événements vers les autres workers
+//  subClient  → reçoit les événements des autres workers
+//
+//  On duplique le client Redis pour respecter la contrainte
+//  ioredis : un client en mode subscribe ne peut pas émettre.
 // ─────────────────────────────────────────────────────────────
 
-const connPerIP = new Map();
-const MAX_CONN = 5; // max 5 sockets simultanés par IP
+const pubClient = redis; // client principal déjà connecté
+const subClient = redis.duplicate(); // client dédié à la souscription
 
-io.use((socket, next) => {
-  const ip =
+subClient.on("error", (err) => {
+  log(`[REDIS-SUB] Erreur : ${err.message}`);
+});
+
+io.adapter(createAdapter(pubClient, subClient));
+log(`[REDIS-ADAPTER] Initialisé (worker PID ${process.pid})`);
+
+// ─────────────────────────────────────────────────────────────
+// MIDDLEWARE 1 — RATE-LIMIT PAR IP (Redis, partagé entre workers)
+//
+//  Clé : "rl:ip:<ip>"  |  TTL 1h de sécurité
+//  Fallback : autorise si Redis down
+// ─────────────────────────────────────────────────────────────
+
+const MAX_CONN_PER_IP = 5;
+
+io.use(async (socket, next) => {
+  const raw =
     socket.handshake.headers["x-forwarded-for"] || socket.handshake.address;
-  const count = connPerIP.get(ip) || 0;
+  const ip = typeof raw === "string" ? raw.split(",")[0].trim() : String(raw);
+  const key = `rl:ip:${ip}`;
 
-  if (count >= MAX_CONN) {
-    log(`[RATE LIMIT IP] bloqué : ${ip} (${count} connexions actives)`);
-    return next(new Error("Too many connections"));
+  try {
+    const count = await redis.incr(key);
+    if (count === 1) await redis.expire(key, 3600);
+
+    if (count > MAX_CONN_PER_IP) {
+      await redis.decr(key);
+      log(
+        `[RATE LIMIT IP] bloqué : ${ip} (${count} connexions) worker=${process.pid}`,
+      );
+      return next(new Error("Too many connections"));
+    }
+
+    socket.on("disconnect", async () => {
+      try {
+        const n = await redis.decr(key);
+        if (n <= 0) await redis.del(key);
+      } catch (err) {
+        log(`[REDIS] Erreur decr connPerIP : ${err.message}`);
+      }
+    });
+
+    socket.data.ip = ip;
+  } catch (err) {
+    log(
+      `[REDIS] rate-limit IP indisponible, connexion autorisée : ${err.message}`,
+    );
   }
-
-  connPerIP.set(ip, count + 1);
-
-  socket.on("disconnect", () => {
-    const n = (connPerIP.get(ip) || 1) - 1;
-    n <= 0 ? connPerIP.delete(ip) : connPerIP.set(ip, n);
-  });
 
   next();
 });
 
 // ─────────────────────────────────────────────────────────────
-// MIDDLEWARE 2 — RATE-LIMIT PAR SOCKET (anti-flood d'événements)
+// MIDDLEWARE 2 — RATE-LIMIT PAR SOCKET (anti-flood, par worker)
+//
+//  Clé : "rl:sock:<socketId>"  |  TTL 1s (fenêtre auto-expirante)
+//  Fallback : compteur mémoire locale si Redis down
 // ─────────────────────────────────────────────────────────────
 
-const EVENT_WINDOW_MS = 1000; // fenêtre glissante d'1 seconde
-const MAX_EVENTS_PER_S = 10; // max 10 événements/s avant déconnexion
+const MAX_EVENTS_PER_S = 10;
 
 io.use((socket, next) => {
-  let count = 0;
-  let resetAt = Date.now() + EVENT_WINDOW_MS;
+  let localCount = 0;
+  let localResetAt = Date.now() + 1000;
 
-  socket.onAny((eventName) => {
-    const now = Date.now();
-    if (now > resetAt) {
-      count = 0;
-      resetAt = now + EVENT_WINDOW_MS;
+  socket.onAny(async (eventName) => {
+    const key = `rl:sock:${socket.id}`;
+    try {
+      const count = await redis.incr(key);
+      if (count === 1) await redis.expire(key, 1);
+
+      if (count > MAX_EVENTS_PER_S) {
+        log(
+          `[FLOOD] socket=${socket.id} event="${eventName}" (${count}/s) worker=${process.pid} → déconnecté`,
+        );
+        socket.disconnect(true);
+      }
+    } catch {
+      const now = Date.now();
+      if (now > localResetAt) {
+        localCount = 0;
+        localResetAt = now + 1000;
+      }
+      localCount++;
+      if (localCount > MAX_EVENTS_PER_S) {
+        log(
+          `[FLOOD-LOCAL] socket=${socket.id} event="${eventName}" (${localCount}/s) → déconnecté`,
+        );
+        socket.disconnect(true);
+      }
     }
-    count++;
-    if (count > MAX_EVENTS_PER_S) {
-      log(
-        `[FLOOD] socket=${socket.id} event="${eventName}" (${count}/s) → déconnecté`,
-      );
-      socket.disconnect(true);
+  });
+
+  socket.on("disconnect", async () => {
+    try {
+      await redis.del(`rl:sock:${socket.id}`);
+    } catch {
+      /* ignoré */
     }
   });
 
@@ -172,10 +242,10 @@ io.use((socket, next) => {
 // SOCKET CONNECTION
 // ─────────────────────────────────────────────────────────────
 
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes sans activité → zombie
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 io.on("connection", (socket) => {
-  log(`+ Connexion : ${socket.id}`);
+  log(`+ Connexion : ${socket.id} worker=${process.pid}`);
 
   socketMeta.set(socket.id, {
     pseudo: "unknown",
@@ -183,45 +253,37 @@ io.on("connection", (socket) => {
     isAdmin: false,
   });
 
-  // ── Debug transport ────────────────────────────────────────
   log(`Transport : ${socket.conn.transport.name}`);
   socket.conn.on("upgrade", () => {
     log(`[UPGRADE] ${socket.id} → ${socket.conn.transport.name}`);
   });
 
-  // ─────────────────────────────────────────────────────────
-  // IDLE TIMEOUT — déconnecte les zombies inactifs
-  // ─────────────────────────────────────────────────────────
-
+  // ── Idle timeout ───────────────────────────────────────────
   let idleTimer = null;
 
   function resetIdle() {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       log(
-        `[IDLE] socket=${socket.id} inactif depuis ${IDLE_TIMEOUT_MS / 1000}s → déconnecté`,
+        `[IDLE] socket=${socket.id} inactif ${IDLE_TIMEOUT_MS / 1000}s → déconnecté`,
       );
       socket.disconnect(true);
     }, IDLE_TIMEOUT_MS);
   }
 
-  resetIdle(); // démarre dès la connexion
-
-  // Réinitialise le timer à chaque événement entrant (ping inclus)
+  resetIdle();
   socket.onAny(() => resetIdle());
 
-  // ── Debug disconnect ───────────────────────────────────────
   socket.on("disconnect", (reason) => {
     clearTimeout(idleTimer);
-    joinroomThrottle.delete(socket.id); // nettoyage throttle joinroom
-    log(`- Déconnexion : ${socket.id} (${reason})`);
+    joinroomThrottle.delete(socket.id);
+    log(`- Déconnexion : ${socket.id} (${reason}) worker=${process.pid}`);
   });
 
   socket.on("connect_error", (err) => {
     log(`Connect error ${socket.id}: ${err.message}`);
   });
 
-  // ── Handlers métier ────────────────────────────────────────
   registerAdminHandler(io, socket);
   registerBidderHandler(io, socket);
   registerRoomHandler(io, socket);
@@ -236,9 +298,7 @@ io.on("connection", (socket) => {
 // ─────────────────────────────────────────────────────────────
 
 server.listen(PORT, () => {
-  log(`Socket.IO server démarré sur port ${PORT}`);
-  log(`Mode : PRODUCTION`);
-  log(`Health : http://localhost:${PORT}/`);
+  log(`Socket.IO server démarré sur port ${PORT} (worker PID ${process.pid})`);
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -247,17 +307,21 @@ server.listen(PORT, () => {
 
 process.on("SIGTERM", () => {
   log("SIGTERM reçu — arrêt propre");
-  server.close(() => process.exit(0));
+  subClient
+    .quit()
+    .finally(() =>
+      redis.quit().finally(() => server.close(() => process.exit(0))),
+    );
 });
 
 process.on("SIGINT", () => {
   log("SIGINT reçu — arrêt propre");
-  server.close(() => process.exit(0));
+  subClient
+    .quit()
+    .finally(() =>
+      redis.quit().finally(() => server.close(() => process.exit(0))),
+    );
 });
-
-// ─────────────────────────────────────────────────────────────
-// PROTECTION GLOBALE CONTRE LES CRASHS
-// ─────────────────────────────────────────────────────────────
 
 process.on("uncaughtException", (err) =>
   log(`[FATAL] uncaughtException: ${err.message}`),
