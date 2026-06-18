@@ -42,13 +42,16 @@ const server = http.createServer(app);
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
-// CORS POUR EXPRESS (AJOUT)
+// CORS POUR EXPRESS (sans credentials)
 // -----------------------------------------------------------------------------
 
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With",
+  );
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
@@ -86,7 +89,7 @@ app.get("/screen/:room", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// SOCKET.IO
+// SOCKET.IO - Configuration CORS sans credentials
 // -----------------------------------------------------------------------------
 
 const io = new Server(server, {
@@ -99,11 +102,11 @@ const io = new Server(server, {
   allowEIO3: true,
   transports: ["polling", "websocket"],
 
-  // CORS PERMISSIF POUR LE TEST
+  // CORS sans credentials - origin wildcard autorise
   cors: {
     origin: "*",
     methods: ["GET", "POST"],
-    credentials: true,
+    credentials: false,
   },
 });
 
