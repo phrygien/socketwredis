@@ -42,16 +42,18 @@ const server = http.createServer(app);
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
-// CORS
+// CORS POUR EXPRESS (AJOUT)
 // -----------------------------------------------------------------------------
 
-const ALLOWED_ORIGINS = [
-  "https://www.auctav.com",
-  "https://auctav.com",
-  "https://dev.astucom.com",
-  "http://localhost",
-  "http://127.0.0.1",
-];
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 // -----------------------------------------------------------------------------
 // HEALTH CHECK
@@ -88,38 +90,18 @@ app.get("/screen/:room", (req, res) => {
 // -----------------------------------------------------------------------------
 
 const io = new Server(server, {
-  // MOBILE / RESEAUX LENTS
   pingInterval: 10000,
   pingTimeout: 20000,
-
-  // GROS PAYLOADS
   maxHttpBufferSize: 1e7,
-
-  // Compression
   perMessageDeflate: {
     threshold: 8192,
   },
-
-  // Compatibilite anciens clients
   allowEIO3: true,
-
-  // polling + websocket
   transports: ["polling", "websocket"],
 
+  // CORS PERMISSIF POUR LE TEST
   cors: {
-    origin: function (origin, callback) {
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      if (ALLOWED_ORIGINS.includes(origin)) {
-        return callback(null, true);
-      }
-
-      log(`CORS bloque : ${origin}`);
-      return callback(new Error("CORS blocked"));
-    },
-
+    origin: "*",
     methods: ["GET", "POST"],
     credentials: true,
   },
