@@ -17,7 +17,9 @@ module.exports = {
         REDIS_HOST: "127.0.0.1",
         REDIS_PORT: "6379",
         REDIS_DB: "0",
-        PORT: "9022",
+        PORT: "3006",
+        ALLOWED_ORIGINS:
+          "https://www.auctav.com,https://auctav.com,https://dev.astucom.com,https://dev.astucom.com:9022",
       },
 
       out_file: "./logs/out.log",

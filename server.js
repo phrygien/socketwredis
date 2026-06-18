@@ -1,6 +1,6 @@
 /**
  * Serveur Socket.IO — Auctav Live Sales
- * Version compatible avec Socket.IO v2.3.0 (client existant)
+ * Version reverse proxy avec Apache
  * MODE CLUSTER AVEC REDIS ADAPTER
  */
 
@@ -9,7 +9,7 @@ const http = require("http");
 const { Server } = require("socket.io");
 const { createAdapter } = require("@socket.io/redis-adapter");
 
-const { PORT } = require("./config");
+const { PORT, ALLOWED_ORIGINS } = require("./config");
 const socketMeta = require("./store");
 const { log } = require("./utils/logger");
 const redis = require("./redis");
@@ -43,32 +43,23 @@ app.use(express.json());
 // CORS POUR EXPRESS
 // -----------------------------------------------------------------------------
 
-const ALLOWED_ORIGINS = [
-  "https://www.auctav.com",
-  "https://auctav.com",
-  "https://dev.astucom.com",
-  "https://dev.astucom.com:9022",
-  "http://localhost",
-  "http://localhost:9022",
-  "http://127.0.0.1",
-  "http://127.0.0.1:9022",
-];
-
+// Permettre toutes les origines pour le reverse proxy
 app.use((req, res, next) => {
   const origin = req.headers.origin;
 
-  if (ALLOWED_ORIGINS.includes(origin)) {
+  // En reverse proxy, on peut être plus permissif
+  if (origin) {
     res.header("Access-Control-Allow-Origin", origin);
-    res.header("Access-Control-Allow-Credentials", "true");
-    res.header(
-      "Access-Control-Allow-Methods",
-      "GET, POST, PUT, DELETE, OPTIONS",
-    );
-    res.header(
-      "Access-Control-Allow-Headers",
-      "Content-Type, Authorization, X-Requested-With",
-    );
+  } else {
+    res.header("Access-Control-Allow-Origin", "*");
   }
+
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With",
+  );
 
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
@@ -87,6 +78,7 @@ app.get("/", (_req, res) => {
     memory: process.memoryUsage(),
     sockets: socketMeta.size,
     cluster: process.env.NODE_APP_INSTANCE || "standalone",
+    port: PORT,
   });
 });
 
@@ -112,27 +104,49 @@ app.get("/screen/:room", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// SOCKET.IO - Configuration spécifique pour v2
+// SOCKET.IO - Configuration reverse proxy
 // -----------------------------------------------------------------------------
 
 const io = new Server(server, {
-  // Configuration pour Socket.IO v2
+  // Configuration standard
   pingInterval: 25000,
   pingTimeout: 60000,
   maxHttpBufferSize: 1e7,
+  perMessageDeflate: {
+    threshold: 8192,
+  },
 
-  // Transports - matching client v2
+  // Transports
   transports: ["polling", "websocket"],
   allowUpgrades: true,
+  allowEIO3: true,
 
-  // CORS - Support credentials
+  // CORS - Permissif pour reverse proxy
   cors: {
     origin: function (origin, callback) {
+      // Autoriser toutes les origines en reverse proxy
       if (!origin) {
         return callback(null, true);
       }
 
-      if (ALLOWED_ORIGINS.includes(origin)) {
+      // Pour la sécurité, on peut vérifier les origines autorisées
+      if (ALLOWED_ORIGINS.includes("*") || ALLOWED_ORIGINS.includes(origin)) {
+        return callback(null, true);
+      }
+
+      // En production, limiter aux origines connues
+      const allowedProduction = [
+        "https://www.auctav.com",
+        "https://auctav.com",
+        "https://dev.astucom.com",
+        "https://dev.astucom.com:9022",
+        "http://localhost",
+        "http://localhost:9022",
+        "http://127.0.0.1",
+        "http://127.0.0.1:9022",
+      ];
+
+      if (allowedProduction.includes(origin)) {
         return callback(null, true);
       }
 
@@ -144,18 +158,15 @@ const io = new Server(server, {
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   },
 
-  // Désactiver le cookie
+  // Désactiver le cookie pour éviter les problèmes
   cookie: false,
 
   // Path par défaut
   path: "/socket.io/",
-
-  // Permettre les anciennes versions
-  allowEIO3: false,
 });
 
 // -----------------------------------------------------------------------------
-// ENGINE.IO CONFIGURATION - Important pour v2
+// ENGINE.IO CONFIGURATION POUR REVERSE PROXY
 // -----------------------------------------------------------------------------
 
 io.engine.on("connection_error", (err) => {
@@ -202,15 +213,18 @@ if (useCluster) {
 }
 
 // -----------------------------------------------------------------------------
-// RATE LIMITING PAR IP
+// RATE LIMITING PAR IP (avec support reverse proxy)
 // -----------------------------------------------------------------------------
 
 const connPerIP = new Map();
 const MAX_CONN = 10;
 
 io.use((socket, next) => {
-  const ip =
-    socket.handshake.headers["x-forwarded-for"] || socket.handshake.address;
+  // Récupérer l'IP réelle depuis le reverse proxy
+  const forwarded = socket.handshake.headers["x-forwarded-for"];
+  const ip = forwarded
+    ? forwarded.split(",")[0].trim()
+    : socket.handshake.address;
 
   const count = connPerIP.get(ip) || 0;
 
@@ -235,7 +249,12 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   const instanceId = process.env.NODE_APP_INSTANCE || "?";
-  log(`[CONNECTION] ${socket.id} (instance ${instanceId})`);
+  const forwarded = socket.handshake.headers["x-forwarded-for"];
+  const clientIp = forwarded
+    ? forwarded.split(",")[0].trim()
+    : socket.handshake.address;
+
+  log(`[CONNECTION] ${socket.id} (instance ${instanceId}) from ${clientIp}`);
 
   socketMeta.set(socket.id, {
     pseudo: "unknown",
@@ -270,15 +289,15 @@ io.on("connection", (socket) => {
 // START SERVER
 // -----------------------------------------------------------------------------
 
-server.listen(PORT, "0.0.0.0", () => {
+server.listen(PORT, "127.0.0.1", () => {
   const instanceId = process.env.NODE_APP_INSTANCE || "standalone";
   log(`========================================`);
   log(`Socket.IO server demarre sur port ${PORT}`);
   log(`Instance: ${instanceId}`);
   log(`Mode: ${process.env.NODE_ENV || "development"}`);
   log(`Cluster: ${useCluster ? "Active (Redis Adapter)" : "Standalone"}`);
-  log(`URL: https://dev.astucom.com:${PORT}`);
-  log(`Health: http://localhost:${PORT}/`);
+  log(`URL externe: https://dev.astucom.com:9022`);
+  log(`Health: http://127.0.0.1:${PORT}/`);
   log(`========================================`);
 
   if (process.send) {
