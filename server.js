@@ -42,16 +42,36 @@ const server = http.createServer(app);
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
-// CORS POUR EXPRESS (sans credentials)
+// CORS POUR EXPRESS - AVEC CREDENTIALS SUPPORT
 // -----------------------------------------------------------------------------
 
+const ALLOWED_ORIGINS = [
+  "https://www.auctav.com",
+  "https://auctav.com",
+  "https://dev.astucom.com",
+  "https://dev.astucom.com:9022",
+  "http://localhost",
+  "http://localhost:9022",
+  "http://127.0.0.1",
+  "http://127.0.0.1:9022",
+];
+
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With",
-  );
+  const origin = req.headers.origin;
+
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Access-Control-Allow-Credentials", "true");
+    res.header(
+      "Access-Control-Allow-Methods",
+      "GET, POST, PUT, DELETE, OPTIONS",
+    );
+    res.header(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Requested-With",
+    );
+  }
+
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
@@ -89,7 +109,7 @@ app.get("/screen/:room", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// SOCKET.IO - Configuration CORS sans credentials
+// SOCKET.IO - CONFIGURATION AVEC CREDENTIALS SUPPORT
 // -----------------------------------------------------------------------------
 
 const io = new Server(server, {
@@ -102,11 +122,25 @@ const io = new Server(server, {
   allowEIO3: true,
   transports: ["polling", "websocket"],
 
-  // CORS sans credentials - origin wildcard autorise
   cors: {
-    origin: "*",
+    origin: function (origin, callback) {
+      // Autoriser les requetes sans origin (curl, apps mobiles, etc.)
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      // Verifier si l'origine est dans la liste autorisee
+      if (ALLOWED_ORIGINS.includes(origin)) {
+        return callback(null, true);
+      }
+
+      // Log pour debugging
+      log(`[CORS] Origine bloquee: ${origin}`);
+      return callback(new Error("CORS not allowed"));
+    },
     methods: ["GET", "POST"],
-    credentials: false,
+    credentials: true,
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   },
 });
 
@@ -219,6 +253,7 @@ server.listen(PORT, () => {
   log(`Instance: ${instanceId}`);
   log(`Mode: ${process.env.NODE_ENV || "development"}`);
   log(`Cluster: ${useCluster ? "Active (Redis Adapter)" : "Standalone"}`);
+  log(`CORS: Origins autorisees: ${ALLOWED_ORIGINS.join(", ")}`);
   log(`Health: http://localhost:${PORT}/`);
 
   if (process.send) {
@@ -253,6 +288,7 @@ process.on("SIGINT", () => {
 
 process.on("uncaughtException", (err) => {
   log(`[FATAL] uncaughtException: ${err.message}`);
+  log(err.stack);
 });
 
 process.on("unhandledRejection", (reason) => {
