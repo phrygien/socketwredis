@@ -299,6 +299,8 @@ io.on("connection", (socket) => {
 
 server.listen(PORT, () => {
   log(`Socket.IO server démarré sur port ${PORT} (worker PID ${process.pid})`);
+  // Signal PM2 que le worker est prêt (requis si wait_ready: true)
+  if (process.send) process.send("ready");
 });
 
 // ─────────────────────────────────────────────────────────────
