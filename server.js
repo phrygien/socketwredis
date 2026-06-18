@@ -1,6 +1,6 @@
 /**
  * Serveur Socket.IO — Auctav Live Sales
- * VERSION STABLE MOBILE + APACHE + SOCKET.IO v2/v3/v4
+ * Version adaptée pour le client existant
  * MODE CLUSTER AVEC REDIS ADAPTER
  */
 
@@ -13,8 +13,6 @@ const { PORT } = require("./config");
 const socketMeta = require("./store");
 const { log } = require("./utils/logger");
 const redis = require("./redis");
-
-const { getRoomStats } = require("./services/roomService");
 
 const { registerAdminHandler } = require("./handlers/adminHandler");
 const { registerBidderHandler } = require("./handlers/bidderHandler");
@@ -42,7 +40,7 @@ const server = http.createServer(app);
 app.use(express.json());
 
 // -----------------------------------------------------------------------------
-// CORS POUR EXPRESS - AVEC CREDENTIALS SUPPORT
+// CORS POUR EXPRESS - Support credentials
 // -----------------------------------------------------------------------------
 
 const ALLOWED_ORIGINS = [
@@ -92,6 +90,13 @@ app.get("/", (_req, res) => {
   });
 });
 
+app.get("/test", (_req, res) => {
+  res.json({
+    message: "Server is running",
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // Followers debug
 app.get("/follow/:room", (req, res) => {
   res.json({
@@ -109,32 +114,34 @@ app.get("/screen/:room", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// SOCKET.IO - CONFIGURATION AVEC CREDENTIALS SUPPORT
+// SOCKET.IO - Configuration pour client existant
 // -----------------------------------------------------------------------------
 
 const io = new Server(server, {
-  pingInterval: 10000,
-  pingTimeout: 20000,
+  // Configuration pour Socket.IO v2/v3 (compatible avec votre client)
+  pingInterval: 25000,
+  pingTimeout: 60000,
   maxHttpBufferSize: 1e7,
   perMessageDeflate: {
     threshold: 8192,
   },
-  allowEIO3: true,
-  transports: ["polling", "websocket"],
 
+  // Transports - matching client
+  transports: ["polling", "websocket"],
+  allowUpgrades: true,
+  allowEIO3: true,
+
+  // CORS - Support credentials comme le client l'utilise
   cors: {
     origin: function (origin, callback) {
-      // Autoriser les requetes sans origin (curl, apps mobiles, etc.)
       if (!origin) {
         return callback(null, true);
       }
 
-      // Verifier si l'origine est dans la liste autorisee
       if (ALLOWED_ORIGINS.includes(origin)) {
         return callback(null, true);
       }
 
-      // Log pour debugging
       log(`[CORS] Origine bloquee: ${origin}`);
       return callback(new Error("CORS not allowed"));
     },
@@ -142,6 +149,22 @@ const io = new Server(server, {
     credentials: true,
     allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   },
+
+  // Désactiver le cookie pour éviter les problèmes
+  cookie: false,
+
+  // Path par défaut
+  path: "/socket.io/",
+});
+
+// -----------------------------------------------------------------------------
+// LOGGING DES REQUETES (pour debug)
+// -----------------------------------------------------------------------------
+
+io.use((socket, next) => {
+  const req = socket.request;
+  log(`[SOCKET REQUEST] URL: ${req.url}`);
+  next();
 });
 
 // -----------------------------------------------------------------------------
@@ -166,10 +189,6 @@ if (useCluster) {
     subClient.on("error", (err) => {
       log(`[REDIS ADAPTER] Erreur subClient: ${err.message}`);
     });
-
-    io.of("/").adapter.on("create-room", (room) => {
-      log(`[REDIS ADAPTER] Room creee: ${room}`);
-    });
   } catch (err) {
     log(`[REDIS ADAPTER] Echec: ${err.message}`);
     log("[REDIS ADAPTER] Le serveur fonctionne en mode standalone");
@@ -183,7 +202,7 @@ if (useCluster) {
 // -----------------------------------------------------------------------------
 
 const connPerIP = new Map();
-const MAX_CONN = 5;
+const MAX_CONN = 10;
 
 io.use((socket, next) => {
   const ip =
@@ -212,7 +231,7 @@ io.use((socket, next) => {
 
 io.on("connection", (socket) => {
   const instanceId = process.env.NODE_APP_INSTANCE || "?";
-  log(`+ Connexion : ${socket.id} (instance ${instanceId})`);
+  log(`[CONNECTION] ${socket.id} (instance ${instanceId})`);
 
   socketMeta.set(socket.id, {
     pseudo: "unknown",
@@ -220,20 +239,21 @@ io.on("connection", (socket) => {
     isAdmin: false,
   });
 
-  log(`Transport : ${socket.conn.transport.name}`);
+  log(`[TRANSPORT] ${socket.id} -> ${socket.conn.transport.name}`);
 
   socket.conn.on("upgrade", () => {
     log(`[UPGRADE] ${socket.id} -> ${socket.conn.transport.name}`);
   });
 
   socket.on("disconnect", (reason) => {
-    log(`- Deconnexion: ${socket.id} (${reason})`);
+    log(`[DISCONNECT] ${socket.id} (${reason})`);
   });
 
   socket.on("connect_error", (err) => {
-    log(`Connect error ${socket.id}: ${err.message}`);
+    log(`[ERROR] ${socket.id}: ${err.message}`);
   });
 
+  // Enregistrer les handlers
   registerAdminHandler(io, socket);
   registerBidderHandler(io, socket);
   registerRoomHandler(io, socket);
@@ -247,14 +267,16 @@ io.on("connection", (socket) => {
 // START SERVER
 // -----------------------------------------------------------------------------
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   const instanceId = process.env.NODE_APP_INSTANCE || "standalone";
+  log(`========================================`);
   log(`Socket.IO server demarre sur port ${PORT}`);
   log(`Instance: ${instanceId}`);
   log(`Mode: ${process.env.NODE_ENV || "development"}`);
   log(`Cluster: ${useCluster ? "Active (Redis Adapter)" : "Standalone"}`);
-  log(`CORS: Origins autorisees: ${ALLOWED_ORIGINS.join(", ")}`);
+  log(`URL: https://dev.astucom.com:${PORT}`);
   log(`Health: http://localhost:${PORT}/`);
+  log(`========================================`);
 
   if (process.send) {
     process.send("ready");
