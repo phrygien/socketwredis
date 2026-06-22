@@ -1,18 +1,43 @@
 /**
  * Serveur Socket.IO — Auctav Live Sales
- * Version reverse proxy avec Apache
- * MODE CLUSTER AVEC REDIS ADAPTER
+ * VERSION CLUSTER : PM2 fork multi-instances + Redis adapter
+ * Compatible Apache + Socket.IO v2/v3/v4
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * ARCHITECTURE CLUSTER (résumé) :
+ *
+ *   - PM2 reste en exec_mode "fork" (PAS "cluster") — chaque instance a son
+ *     propre port (4000, 4001, ...), injecté via NODE_APP_INSTANCE.
+ *     Choix volontaire : exec_mode "cluster" + module cluster natif de Node
+ *     nécessite @socket.io/sticky + un primary process dédié, incompatible
+ *     avec un PM2 standard partagé avec d'autres apps sur ce VPS. Le fork
+ *     mode multi-ports évite ce risque.
+ *
+ *   - Apache fait le sticky load-balancing (cookie ROUTEID) entre les ports
+ *     — nécessaire pour que le long-polling fonctionne (un client doit
+ *     retomber sur le même worker pendant tout son handshake HTTP).
+ *
+ *   - Le Redis adapter (@socket.io/redis-adapter) permet à io.emit() /
+ *     io.to(room).emit() d'atteindre TOUS les clients, même connectés à un
+ *     autre worker — sans ça, chaque worker serait une île isolée.
+ *
+ *   - Le store applicatif (room, isAdmin, pseudo par socket) est lui aussi
+ *     mis en miroir dans Redis (voir store.js) car c'est un état métier
+ *     distinct du transport Socket.IO — le Redis adapter ne le gère pas
+ *     automatiquement.
+ * ─────────────────────────────────────────────────────────────────────────
  */
 
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
+const { createClient } = require("redis");
 const { createAdapter } = require("@socket.io/redis-adapter");
 
-const { PORT, ALLOWED_ORIGINS } = require("./config");
-const socketMeta = require("./store");
 const { log } = require("./utils/logger");
-const redis = require("./redis");
+const store = require("./store");
+
+const { getRoomStats } = require("./services/roomService");
 
 const { registerAdminHandler } = require("./handlers/adminHandler");
 const { registerBidderHandler } = require("./handlers/bidderHandler");
@@ -30,65 +55,109 @@ const {
   getScreensInRoom,
 } = require("./handlers/screenHandler");
 
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
+// PORT — un par instance PM2 (fork mode, pas cluster mode)
+// ─────────────────────────────────────────────────────────────
+//
+// PM2 injecte NODE_APP_INSTANCE (0, 1, 2, ...) automatiquement quand
+// `instances` > 1 en exec_mode "fork". BASE_PORT reste configurable via
+// l'env si besoin (ex: staging sur une autre plage de ports).
+
+const BASE_PORT = Number(process.env.BASE_PORT || 4000);
+const INSTANCE_OFFSET = process.env.NODE_APP_INSTANCE
+  ? Number(process.env.NODE_APP_INSTANCE)
+  : 0;
+const PORT = BASE_PORT + INSTANCE_OFFSET;
+
+// ─────────────────────────────────────────────────────────────
+// REDIS — URL partagée pour l'adapter ET le store applicatif
+// ─────────────────────────────────────────────────────────────
+
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+
+// ─────────────────────────────────────────────────────────────
 // EXPRESS
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
 
 const app = express();
 const server = http.createServer(app);
 
 app.use(express.json());
 
-// -----------------------------------------------------------------------------
-// CORS POUR EXPRESS
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
+// CORS
+// ─────────────────────────────────────────────────────────────
 
-// Permettre toutes les origines pour le reverse proxy
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
+const ALLOWED_ORIGINS = [
+  "https://www.auctav.com",
+  "https://auctav.com",
+  "https://dev.astucom.com",
+  "http://localhost",
+  "http://127.0.0.1",
+];
 
-  // En reverse proxy, on peut être plus permissif
-  if (origin) {
-    res.header("Access-Control-Allow-Origin", origin);
-  } else {
-    res.header("Access-Control-Allow-Origin", "*");
+// ─────────────────────────────────────────────────────────────
+// RATE LIMITING PAR IP
+// ─────────────────────────────────────────────────────────────
+//
+// NOTE CLUSTER : connPerIP reste local à ce worker. Avec N instances, un
+// client peut en théorie ouvrir MAX_CONN connexions PAR worker s'il retombe
+// sur des process différents avant l'établissement du cookie sticky. Le
+// sticky Apache (ROUTEID) limite fortement ce risque en pratique : une fois
+// le cookie posé, le même client IP retombe toujours sur le même worker.
+// Si une limite STRICTE tous-workers-confondus est nécessaire, ce compteur
+// devrait être déplacé dans Redis (INCR + EXPIRE) — non fait ici pour
+// garder le hot path de connexion rapide ; à revoir si abus constatés.
+
+const connPerIP = new Map();
+const MAX_CONN = 5;
+
+setInterval(() => {
+  let cleaned = 0;
+  for (const [ip, count] of connPerIP.entries()) {
+    if (count <= 0) {
+      connPerIP.delete(ip);
+      cleaned++;
+    }
   }
-
-  res.header("Access-Control-Allow-Credentials", "true");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Requested-With",
-  );
-
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
+  if (cleaned > 0) {
+    log(`[RATE LIMIT] Nettoyage : ${cleaned} entrées supprimées`);
   }
-  next();
-});
+}, 60_000);
 
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
 // HEALTH CHECK
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
+//
+// NOTE CLUSTER : /rooms-stats (cross-worker, via Redis) est ASYNC et séparé
+// du health check de base, qui reste synchrone et local pour répondre
+// instantanément même si Redis a un souci (le process Node tourne quand
+// même, l'info est juste incomplète plutôt que silencieuse).
 
 app.get("/", (_req, res) => {
   res.json({
     status: "ok",
+    pid: process.pid,
+    port: PORT,
     uptime: process.uptime(),
     memory: process.memoryUsage(),
-    sockets: socketMeta.size,
-    cluster: process.env.NODE_APP_INSTANCE || "standalone",
-    port: PORT,
+    sockets: store.size(), // local à ce worker uniquement
+    connPerIP: connPerIP.size, // local à ce worker uniquement
   });
 });
 
-app.get("/test", (_req, res) => {
-  res.json({
-    message: "Server is running",
-    timestamp: new Date().toISOString(),
-  });
+// Stats cross-worker (toutes instances confondues, via Redis)
+app.get("/rooms-stats", async (_req, res) => {
+  try {
+    const stats = await getRoomStats();
+    res.json(stats);
+  } catch (err) {
+    log(`[/rooms-stats] erreur: ${err.message}`);
+    res.status(500).json({ error: "stats indisponibles" });
+  }
 });
 
+// Followers debug
 app.get("/follow/:room", (req, res) => {
   res.json({
     room: req.params.room,
@@ -96,6 +165,7 @@ app.get("/follow/:room", (req, res) => {
   });
 });
 
+// Screens debug
 app.get("/screen/:room", (req, res) => {
   res.json({
     room: req.params.room,
@@ -103,133 +173,61 @@ app.get("/screen/:room", (req, res) => {
   });
 });
 
-// -----------------------------------------------------------------------------
-// SOCKET.IO - Configuration reverse proxy
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
+// SOCKET.IO
+// ─────────────────────────────────────────────────────────────
 
 const io = new Server(server, {
-  // Configuration standard
-  pingInterval: 25000,
-  pingTimeout: 60000,
-  maxHttpBufferSize: 1e7,
+  // MOBILE / RÉSEAUX LENTS
+  pingInterval: 10000,
+  pingTimeout: 20000,
+
+  // Timeout handshake — coupe les connexions qui traînent
+  connectTimeout: 10000,
+
+  // GROS PAYLOADS
+  maxHttpBufferSize: 1e7, // 10Mo
+
+  // Compression — seuil relevé pour éviter de compresser les petits messages
   perMessageDeflate: {
     threshold: 8192,
   },
 
-  // Transports
-  transports: ["polling", "websocket"],
-  allowUpgrades: true,
+  // Compatibilité anciens clients
   allowEIO3: true,
 
-  // CORS - Permissif pour reverse proxy
+  // polling + websocket — conservé pour le fallback réseaux mobiles/lents.
+  // Implique le sticky load-balancing côté Apache (cookie ROUTEID).
+  transports: ["polling", "websocket"],
+
   cors: {
     origin: function (origin, callback) {
-      // Autoriser toutes les origines en reverse proxy
       if (!origin) {
         return callback(null, true);
       }
 
-      // Pour la sécurité, on peut vérifier les origines autorisées
-      if (ALLOWED_ORIGINS.includes("*") || ALLOWED_ORIGINS.includes(origin)) {
+      if (ALLOWED_ORIGINS.includes(origin)) {
         return callback(null, true);
       }
 
-      // En production, limiter aux origines connues
-      const allowedProduction = [
-        "https://www.auctav.com",
-        "https://auctav.com",
-        "https://dev.astucom.com",
-        "https://dev.astucom.com:9022",
-        "http://localhost",
-        "http://localhost:9022",
-        "http://127.0.0.1",
-        "http://127.0.0.1:9022",
-      ];
+      log(`CORS bloqué : ${origin}`);
 
-      if (allowedProduction.includes(origin)) {
-        return callback(null, true);
-      }
-
-      log(`[CORS] Origine bloquee: ${origin}`);
-      return callback(new Error("CORS not allowed"));
+      return callback(new Error("CORS blocked"));
     },
+
     methods: ["GET", "POST"],
     credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   },
-
-  // Désactiver le cookie pour éviter les problèmes
-  cookie: false,
-
-  // Path par défaut
-  path: "/socket.io/",
 });
-
-// -----------------------------------------------------------------------------
-// ENGINE.IO CONFIGURATION POUR REVERSE PROXY
-// -----------------------------------------------------------------------------
-
-io.engine.on("connection_error", (err) => {
-  log(`[ENGINE ERROR] ${err.code} - ${err.message}`);
-});
-
-io.engine.on("connection", (socket) => {
-  log(`[ENGINE] Connection from: ${socket.id}`);
-  log(`[ENGINE] Transport: ${socket.transport.name}`);
-
-  socket.on("upgrade", () => {
-    log(`[ENGINE] Upgrade to: ${socket.transport.name}`);
-  });
-});
-
-// -----------------------------------------------------------------------------
-// INTEGRATION REDIS ADAPTER POUR LE MODE CLUSTER
-// -----------------------------------------------------------------------------
-
-const useCluster =
-  process.env.NODE_ENV === "production" ||
-  process.env.USE_REDIS_ADAPTER === "true" ||
-  process.env.NODE_APP_INSTANCE !== undefined;
-
-if (useCluster) {
-  try {
-    const pubClient = redis;
-    const subClient = redis.duplicate();
-
-    io.adapter(createAdapter(pubClient, subClient));
-
-    const instanceId = process.env.NODE_APP_INSTANCE || "standalone";
-    log(`[REDIS ADAPTER] Active pour l'instance ${instanceId}`);
-
-    subClient.on("error", (err) => {
-      log(`[REDIS ADAPTER] Erreur subClient: ${err.message}`);
-    });
-  } catch (err) {
-    log(`[REDIS ADAPTER] Echec: ${err.message}`);
-    log("[REDIS ADAPTER] Le serveur fonctionne en mode standalone");
-  }
-} else {
-  log("[REDIS ADAPTER] Desactive (mode developpement/standalone)");
-}
-
-// -----------------------------------------------------------------------------
-// RATE LIMITING PAR IP (avec support reverse proxy)
-// -----------------------------------------------------------------------------
-
-const connPerIP = new Map();
-const MAX_CONN = 10;
 
 io.use((socket, next) => {
-  // Récupérer l'IP réelle depuis le reverse proxy
-  const forwarded = socket.handshake.headers["x-forwarded-for"];
-  const ip = forwarded
-    ? forwarded.split(",")[0].trim()
-    : socket.handshake.address;
+  const ip =
+    socket.handshake.headers["x-forwarded-for"] || socket.handshake.address;
 
   const count = connPerIP.get(ip) || 0;
 
   if (count >= MAX_CONN) {
-    log(`[RATE LIMIT] IP bloquee : ${ip} (${count} connexions)`);
+    log(`[RATE LIMIT] IP bloquée : ${ip} (${count} connexions)`);
     return next(new Error("Too many connections"));
   }
 
@@ -243,38 +241,44 @@ io.use((socket, next) => {
   next();
 });
 
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
 // SOCKET CONNECTION
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
 
 io.on("connection", (socket) => {
-  const instanceId = process.env.NODE_APP_INSTANCE || "?";
-  const forwarded = socket.handshake.headers["x-forwarded-for"];
-  const clientIp = forwarded
-    ? forwarded.split(",")[0].trim()
-    : socket.handshake.address;
+  log(`+ Connexion : ${socket.id} (worker pid=${process.pid}, port=${PORT})`);
 
-  log(`[CONNECTION] ${socket.id} (instance ${instanceId}) from ${clientIp}`);
-
-  socketMeta.set(socket.id, {
+  store.set(socket.id, {
     pseudo: "unknown",
     room: null,
     isAdmin: false,
   });
 
-  log(`[TRANSPORT] ${socket.id} -> ${socket.conn.transport.name}`);
+  // ───────────────────────────────────────────────────
+  // DEBUG TRANSPORT
+  // ───────────────────────────────────────────────────
+
+  log(`Transport : ${socket.conn.transport.name}`);
 
   socket.conn.on("upgrade", () => {
     log(`[UPGRADE] ${socket.id} -> ${socket.conn.transport.name}`);
   });
 
+  // ───────────────────────────────────────────────────
+  // DEBUG DISCONNECT
+  // ───────────────────────────────────────────────────
+
   socket.on("disconnect", (reason) => {
-    log(`[DISCONNECT] ${socket.id} (${reason})`);
+    log(`- Déconnexion: ${socket.id} (${reason})`);
   });
 
   socket.on("connect_error", (err) => {
-    log(`[ERROR] ${socket.id}: ${err.message}`);
+    log(`Connect error ${socket.id}: ${err.message}`);
   });
+
+  // ───────────────────────────────────────────────────
+  // HANDLERS
+  // ───────────────────────────────────────────────────
 
   registerAdminHandler(io, socket);
   registerBidderHandler(io, socket);
@@ -285,56 +289,65 @@ io.on("connection", (socket) => {
   registerDisconnectHandler(io, socket);
 });
 
-// -----------------------------------------------------------------------------
-// START SERVER
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
+// REDIS ADAPTER — broadcast cross-worker pour Socket.IO
+// + connexion du store applicatif partagé (room/isAdmin/pseudo)
+// ─────────────────────────────────────────────────────────────
+//
+// Le serveur HTTP n'écoute QUE lorsque Redis est connecté — tourner sans
+// l'adapter en prod cluster signifierait des rooms qui ne se voient plus
+// entre workers (silencieux, donc pire qu'un crash franc). On préfère
+// process.exit(1) et laisser PM2 redémarrer proprement.
 
-server.listen(PORT, "127.0.0.1", () => {
-  const instanceId = process.env.NODE_APP_INSTANCE || "standalone";
-  log(`========================================`);
-  log(`Socket.IO server demarre sur port ${PORT}`);
-  log(`Instance: ${instanceId}`);
-  log(`Mode: ${process.env.NODE_ENV || "development"}`);
-  log(`Cluster: ${useCluster ? "Active (Redis Adapter)" : "Standalone"}`);
-  log(`URL externe: https://dev.astucom.com:9022`);
-  log(`Health: http://127.0.0.1:${PORT}/`);
-  log(`========================================`);
+const pubClient = createClient({ url: REDIS_URL });
+const subClient = pubClient.duplicate();
 
-  if (process.send) {
-    process.send("ready");
-    log("PM2 ready signal envoye");
-  }
-});
+pubClient.on("error", (err) => log(`[REDIS pubClient] ${err.message}`));
+subClient.on("error", (err) => log(`[REDIS subClient] ${err.message}`));
 
-// -----------------------------------------------------------------------------
+Promise.all([pubClient.connect(), subClient.connect(), store.connect()])
+  .then(() => {
+    io.adapter(createAdapter(pubClient, subClient));
+    log("[REDIS] Adapter Socket.IO connecté — broadcast cross-worker actif");
+
+    server.listen(PORT, () => {
+      log(`Socket.IO server démarré sur port ${PORT} (pid=${process.pid})`);
+      log(`Mode : PRODUCTION (cluster via Redis adapter)`);
+      log(`Health : http://localhost:${PORT}/`);
+    });
+  })
+  .catch((err) => {
+    log(`[FATAL] Connexion Redis échouée: ${err.message}`);
+    process.exit(1); // PM2 redémarre — ne pas tourner sans adapter en prod cluster
+  });
+
+// ─────────────────────────────────────────────────────────────
 // GRACEFUL SHUTDOWN
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
 
-process.on("SIGTERM", () => {
-  log("SIGTERM recu - arret propre");
-  server.close(() => {
-    redis.quit();
-    process.exit(0);
+function shutdown(signal) {
+  log(`${signal} reçu — arrêt propre`);
+  Promise.allSettled([pubClient.quit(), subClient.quit()]).finally(() => {
+    server.close(() => process.exit(0));
   });
-});
+}
 
-process.on("SIGINT", () => {
-  log("SIGINT recu - arret propre");
-  server.close(() => {
-    redis.quit();
-    process.exit(0);
-  });
-});
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
-// -----------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────
 // PROTECTION GLOBALE CONTRE LES CRASHS
-// -----------------------------------------------------------------------------
+// process.exit(1) — laisse PM2 redémarrer proprement plutôt
+// que de continuer dans un état corrompu
+// ─────────────────────────────────────────────────────────────
 
 process.on("uncaughtException", (err) => {
   log(`[FATAL] uncaughtException: ${err.message}`);
-  log(err.stack);
+  log(err.stack || "");
+  process.exit(1);
 });
 
 process.on("unhandledRejection", (reason) => {
   log(`[FATAL] unhandledRejection: ${reason}`);
+  process.exit(1);
 });
