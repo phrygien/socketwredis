@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "socket-server",
+      name: "socket-server-v2",
       script: "./server.js",
 
       // ── CLUSTER (fork multi-instances, PAS exec_mode "cluster") ──────────
