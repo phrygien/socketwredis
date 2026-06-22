@@ -7,9 +7,10 @@ module.exports = {
       // ── CLUSTER (fork multi-instances, PAS exec_mode "cluster") ──────────
       // 4 instances sur 8 cores : laisse de la marge CPU pour Apache et les
       // 2 autres apps PM2 (Laravel queue, etc.) déjà sur ce VPS.
-      // Chaque instance écoute sur un port distinct (4000, 4001, 4002, 4003)
+      // Chaque instance écoute sur un port distinct (3007, 3008, 3009, 3010)
       // via NODE_APP_INSTANCE, injecté automatiquement par PM2 en fork mode
-      // dès que `instances` > 1.
+      // dès que `instances` > 1. Ces 4 ports doivent correspondre exactement
+      // aux BalancerMember déclarés dans la VirtualHost Apache.
       instances: 4,
       exec_mode: "fork",
 
@@ -23,7 +24,7 @@ module.exports = {
       // Variables d'environnement
       env: {
         NODE_ENV: "production",
-        BASE_PORT: 4000,
+        BASE_PORT: 3007, // aligné sur la VirtualHost Apache (3007-3010)
         REDIS_URL: "redis://127.0.0.1:6379",
       },
 

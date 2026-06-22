@@ -7,7 +7,7 @@
  * ARCHITECTURE CLUSTER (résumé) :
  *
  *   - PM2 reste en exec_mode "fork" (PAS "cluster") — chaque instance a son
- *     propre port (4000, 4001, ...), injecté via NODE_APP_INSTANCE.
+ *     propre port (3007, 3008, ...), injecté via NODE_APP_INSTANCE.
  *     Choix volontaire : exec_mode "cluster" + module cluster natif de Node
  *     nécessite @socket.io/sticky + un primary process dédié, incompatible
  *     avec un PM2 standard partagé avec d'autres apps sur ce VPS. Le fork
@@ -63,7 +63,7 @@ const {
 // `instances` > 1 en exec_mode "fork". BASE_PORT reste configurable via
 // l'env si besoin (ex: staging sur une autre plage de ports).
 
-const BASE_PORT = Number(process.env.BASE_PORT || 4000);
+const BASE_PORT = Number(process.env.BASE_PORT || 3007);
 const INSTANCE_OFFSET = process.env.NODE_APP_INSTANCE
   ? Number(process.env.NODE_APP_INSTANCE)
   : 0;
